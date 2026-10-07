@@ -2,7 +2,7 @@
 
 Windows 桌面工具（v5.11）：双击 PrtSc 保存原生全屏截图到 Eagle；长按开始/停止全屏录制，保存 MP4 后自动导入 Eagle。EXE 提供中文设置界面。
 
-**[下载 v5.11 便携包（含 EXE）](https://github.com/Porco24/EaglePrtSc/raw/refs/heads/main/downloads/EaglePrtSc-v5.11.zip)**。解压后打开 `EaglePrtSc.exe`；首次启动自动检查并安装缺少的 FFmpeg / ffprobe。Eagle 需单独安装并运行。
+**[下载 v5.11 便携包（含 EXE）](https://github.com/Porco24/EaglePrtSc/releases/download/v5.11/EaglePrtSc-v5.11.zip)**，也可查看 [Releases](https://github.com/Porco24/EaglePrtSc/releases)。解压后打开 `EaglePrtSc.exe`；首次启动自动检查并安装缺少的 FFmpeg / ffprobe。Eagle 需单独安装并运行。
 
 ## 功能
 
