@@ -1,0 +1,31 @@
+﻿# Captures, local library state, logs and recording intermediates
+Pending/
+RecordingWork/
+Tools/
+*.log
+*.submitted.json
+*.confirmed.json
+*.validated.json
+*.cancelled.json
+*.recording.json
+*-test.txt
+*.lnk
+
+# Local installation paths and build output
+eagle-path.txt
+ffmpeg-path.txt
+ffprobe-path.txt
+settings.json
+settings.json.bak
+.build/
+*.exe
+*.retired
+*.pdb
+*.zip
+
+# Editor and temporary files
+.vs/
+.vscode/
+*.tmp
+
+EaglePrtSc.update
