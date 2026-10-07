@@ -48,8 +48,7 @@ jobs:
           NOTES
           RELEASE_ID="$(gh api "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$TAG\") | .id")"
           if [ -z "$RELEASE_ID" ]; then
-            gh release create "$TAG" --repo "$GH_REPO" --target "$GITHUB_SHA" --draft --title "EaglePrtSc $TAG" --notes-file release-notes.md
-            RELEASE_ID="$(gh api "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$TAG\") | .id")"
+            RELEASE_ID="$(gh api "repos/$GH_REPO/releases" --method POST --field draft=true --raw-field tag_name="$TAG" --raw-field target_commitish="$GITHUB_SHA" --raw-field name="EaglePrtSc $TAG" --raw-field body="$(cat release-notes.md)" --jq .id)"
           fi
           test -n "$RELEASE_ID"
           for FILE in "$PACKAGE_FILE" SHA256SUMS.txt; do
