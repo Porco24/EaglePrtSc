@@ -13,8 +13,8 @@ using System.Windows.Forms;
 [assembly:System.Reflection.AssemblyTitle("EaglePrtSc")]
 [assembly:System.Reflection.AssemblyProduct("EaglePrtSc")]
 [assembly:System.Reflection.AssemblyDescription("PrtSc screenshot and screen recording settings for Eagle")]
-[assembly:System.Reflection.AssemblyVersion("5.12.0.0")]
-[assembly:System.Reflection.AssemblyFileVersion("5.12.0.0")]
+[assembly:System.Reflection.AssemblyVersion("5.14.0.0")]
+[assembly:System.Reflection.AssemblyFileVersion("5.14.0.0")]
 
 public sealed class CaptureSettings
 {

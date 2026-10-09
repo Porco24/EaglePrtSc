@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: eagleprtsc-release-v5.12
+  group: eagleprtsc-release-v5.14
   cancel-in-progress: false
 
 jobs:
@@ -20,10 +20,10 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
-      TAG: v5.12
-      PACKAGE_FILE: EaglePrtSc-v5.12.zip
-      PACKAGE_BLOB: 2d78091827632135ea3a5282c9218c9d6a6c3b43
-      PACKAGE_SHA256: 0f3532d8dca8caea138abcf98dfe280777462074f16b34257086a1e59ffc46a1
+      TAG: v5.14
+      PACKAGE_FILE: EaglePrtSc-v5.14.zip
+      PACKAGE_BLOB: bf8372350de2a51b7a255b67badf6f7d921d843f
+      PACKAGE_SHA256: 824b434f8f9f768ba8e07a3dc05c57e27f7aceb04e6c84ecd0371ee904294483
     steps:
       - name: Verify package, upload assets, and publish
         shell: bash
@@ -45,7 +45,11 @@ jobs:
           cat > release-notes.md <<'NOTES'
           Windows 截图与录制工具，含中文设置界面。
           
-          本次更新：取消截图、录制开始和保存完成的提示音；导入及录制错误改为无声文字提示，错误提示保留五秒。已保存的视频参数保持原值。
+          本次更新：修复系统录音逐包时间戳抖动导致的补零 / 裁采样爆音，改为按声卡采样位置连续拼接，保留真实静音和缺失帧；录音线程使用 MMCSS Audio 调度，并新增断流、缺失采样和时间戳诊断。
+          
+          同时包含 GPU 录制优化：原尺寸、无锐化、单屏 NVENC 直接使用 D3D11 纹理编码，减少 CPU 拷贝；60 fps 保留采集调度余量，GPU 初始化失败自动回退。
+          
+          可控测试音中的高频杂音指标降低约 36 dB；44.1 / 48 kHz 音频连续性、真实桌面 60 fps 录制和完整 MP4 解码检查通过。默认继续使用 60 fps，只录电脑声音、不录麦克风；无声提示和已有设置保持。游戏效果仍需按实际场景验证。
           
           - 双击 PrtSc 截图并导入 Eagle；长按开始或停止录制。
           - 支持图片格式、分辨率比例、视频画质 / 码率、帧率（最高 200 fps）、电脑声音、鼠标显示和锐化设置。
@@ -53,7 +57,7 @@ jobs:
           - 首次启动自动检查并安装缺少的 FFmpeg / ffprobe，可在设置中注册开机启动。
           - 入库校验后清理本地缓存，导入失败时保留原文件。
           
-          下载 EaglePrtSc-v5.12.zip，解压后打开 EaglePrtSc.exe；需单独安装并运行 Eagle。
+          下载 EaglePrtSc-v5.14.zip，解压后打开 EaglePrtSc.exe；需单独安装并运行 Eagle。
           SHA256SUMS.txt 提供便携包校验值。源码可下载本页自动生成的 Source code。
           首次自动联网安装仍需在正常 Windows 桌面环境确认。
           NOTES

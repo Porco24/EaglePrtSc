@@ -299,6 +299,7 @@ internal static class Program
         }
         if(args.Length==2 && args[0]=="--test-settings")return SettingsTests.Run(args[1]);
         if(args.Length==2 && args[0]=="--test-color")return ColorEncodingTests.Run(args[1]);
+        if(args.Length==2 && args[0]=="--test-desktop-performance")return DesktopPerformanceTests.Run(args[1]);
         if(args.Length==2 && args[0]=="--preview-settings")
         {
             Native.SetProcessDpiAwarenessContext(new IntPtr(-4));Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);
@@ -312,6 +313,7 @@ internal static class Program
             return 0;
         }
         if(args.Length==2 && (args[0]=="--test-media" || args[0]=="--test-loopback" || args[0]=="--test-recording" || args[0]=="--test-recording-pipeline")) return RecordingTests.Run(args[0],args[1]);
+        if(args.Length==2 && args[0]=="--test-audio-timeline") return AudioTimelineTests.Run(args[1]);
         if(args.Length==2 && args[0]=="--test-feedback")
         {
             Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);

@@ -39,6 +39,10 @@ if ($ValidateMedia) {
         $path = Join-Path $PSScriptRoot $name
         if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination $buildDirectory -Force }
     }
+    $audioDirectory = Join-Path $buildDirectory ('audio-timeline-' + [Guid]::NewGuid().ToString('N'))
+    $process = Start-Process -FilePath $compiled -ArgumentList @('--test-audio-timeline', ('"' + $audioDirectory + '"')) -WindowStyle Hidden -Wait -PassThru
+    if ($process.ExitCode -ne 0) { throw ('Audio timeline validation failed; see ' + $audioDirectory + '\failure.txt') }
+    Write-Output (Get-Content -LiteralPath (Join-Path $audioDirectory 'audio-timeline-test.txt'))
     $validationDirectory = Join-Path $buildDirectory ('video-validation-' + [Guid]::NewGuid().ToString('N'))
     $process = Start-Process -FilePath $compiled -ArgumentList @('--test-video-validation', ('"' + $validationDirectory + '"')) -WindowStyle Hidden -Wait -PassThru
     if ($process.ExitCode -ne 0) { throw ('Upload video validation failed; see ' + $validationDirectory + '\failure.txt') }

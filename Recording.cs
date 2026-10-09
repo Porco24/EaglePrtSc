@@ -59,6 +59,8 @@ internal static class AudioInterop
     internal static void Release(object value){if(value!=null && Marshal.IsComObject(value))Marshal.ReleaseComObject(value);}
     internal static double Qpc(){return Stopwatch.GetTimestamp()*(10000000.0/Stopwatch.Frequency);}
     internal static double UnixNow(){return (DateTime.UtcNow-new DateTime(1970,1,1)).TotalSeconds;}
+    [DllImport("avrt.dll",CharSet=CharSet.Unicode,SetLastError=true)] internal static extern IntPtr AvSetMmThreadCharacteristics(string task,ref uint index);
+    [DllImport("avrt.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] internal static extern bool AvRevertMmThreadCharacteristics(IntPtr task);
 }
 
 // Timestamped packets preserve silence before/between sounds instead of concatenating packets.
@@ -106,6 +108,49 @@ internal sealed class TimelineWave : IDisposable
     }
 }
 
+// QPC anchors the start for A/V sync; device sample positions preserve continuity.
+// Re-rounding QPC on every packet inserts/cuts samples even with a perfect device stream.
+internal sealed class AudioSampleClock
+{
+    readonly int rate;
+    readonly double origin;
+    bool anchored,received;
+    long anchorPosition,anchorTarget,lastPosition;
+    internal long Packets,Discontinuities,TimestampErrors,MissingFrames,OverlapFrames,ClockResets,QpcBoundaryDifferences,MaxQpcDifference;
+    internal AudioSampleClock(int rate,double origin){this.rate=rate;this.origin=origin;}
+    internal long Target(ulong position,ulong qpc,uint flags,int frames,double nowQpc,long written)
+    {
+        long now=Math.Max(0,(long)Math.Round((nowQpc-origin)*rate/10000000.0));
+        long stamp=(long)Math.Round(((double)qpc-origin)*rate/10000000.0);
+        bool valid=(flags&4)==0 && position<=(ulong)long.MaxValue && stamp>=-rate && stamp<=now+rate;
+        if(received && (flags&1)!=0)Discontinuities++; // The first packet commonly has this flag.
+        if(!valid)TimestampErrors++;
+        long target=written;
+        if(valid)
+        {
+            long pos=(long)position;
+            if(!anchored || pos<lastPosition)
+            {
+                if(anchored)ClockResets++;
+                anchorPosition=pos;anchorTarget=received?Math.Max(written,Math.Max(0,stamp)):Math.Max(0,stamp);anchored=true;
+            }
+            target=anchorTarget+(pos-anchorPosition);
+            if(target<0 || target>now+rate)
+            {
+                ClockResets++;anchorPosition=pos;anchorTarget=written;target=written;
+            }
+            if(received)
+            {
+                long error=Math.Abs(stamp-target);if(error!=0)QpcBoundaryDifferences++;MaxQpcDifference=Math.Max(MaxQpcDifference,error);
+            }
+            lastPosition=pos;
+        }
+        else if(!received)target=Math.Max(0,now-frames);
+        if(received){MissingFrames+=Math.Max(0,target-written);OverlapFrames+=Math.Min(frames,Math.Max(0,written-target));}
+        received=true;Packets++;return target;
+    }
+}
+
 internal sealed class LoopbackAudio : IDisposable
 {
     readonly string path;
@@ -116,6 +161,9 @@ internal sealed class LoopbackAudio : IDisposable
     internal string DeviceId {get;private set;}
     internal int Rate {get;private set;}
     internal long DataFrames {get;private set;}
+    internal AudioSampleClock Clock {get;private set;}
+    internal double MaxReadIntervalMs {get;private set;}
+    internal bool MultimediaScheduling {get;private set;}
     internal LoopbackAudio(string path)
     {
         this.path=path;worker=new Thread(Run);worker.IsBackground=true;worker.Name="System playback loopback";worker.SetApartmentState(ApartmentState.MTA);
@@ -127,7 +175,7 @@ internal sealed class LoopbackAudio : IDisposable
     }
     void Run()
     {
-        AudioInterop.IDevices devices=null;AudioInterop.IDevice device=null;AudioInterop.IClient client=null;AudioInterop.ICapture capture=null;IntPtr format=IntPtr.Zero;
+        AudioInterop.IDevices devices=null;AudioInterop.IDevice device=null;AudioInterop.IClient client=null;AudioInterop.ICapture capture=null;IntPtr format=IntPtr.Zero,mmcss=IntPtr.Zero;
         try
         {
             devices=(AudioInterop.IDevices)new AudioInterop.Enumerator();
@@ -140,7 +188,10 @@ internal sealed class LoopbackAudio : IDisposable
             Guid captureId=typeof(AudioInterop.ICapture).GUID;AudioInterop.Check(client.GetService(ref captureId,out service));capture=(AudioInterop.ICapture)service;
             using(var wave=new TimelineWave(path,bytes))
             {
-                Rate=wave.Rate;double origin=AudioInterop.Qpc();OriginUnix=AudioInterop.UnixNow();AudioInterop.Check(client.Start());ready.Set();
+                uint taskIndex=0;mmcss=AudioInterop.AvSetMmThreadCharacteristics("Audio",ref taskIndex);MultimediaScheduling=mmcss!=IntPtr.Zero;
+                Rate=wave.Rate;double origin=AudioInterop.Qpc();OriginUnix=AudioInterop.UnixNow();Clock=new AudioSampleClock(Rate,origin);
+                byte[] buffer=new byte[checked(Rate*wave.Align/10)];double lastRead=origin;
+                AudioInterop.Check(client.Start());ready.Set();
                 while(true)
                 {
                     uint packet;AudioInterop.Check(capture.GetNextPacketSize(out packet));
@@ -149,27 +200,28 @@ internal sealed class LoopbackAudio : IDisposable
                         IntPtr data;uint frames,flags;ulong position,qpc;AudioInterop.Check(capture.GetBuffer(out data,out frames,out flags,out position,out qpc));
                         try
                         {
-                            byte[] buffer=null;if((flags&2)==0){buffer=new byte[checked((int)frames*wave.Align)];Marshal.Copy(data,buffer,0,buffer.Length);DataFrames+=frames;}
-                            long target=(flags&4)==0?(long)Math.Round(((double)qpc-origin)*Rate/10000000.0):Math.Max(wave.Frames,(long)((AudioInterop.Qpc()-origin)*Rate/10000000.0)-frames);
-                            // Guard bad device timestamps without manufacturing hours of silence.
-                            long now=(long)((AudioInterop.Qpc()-origin)*Rate/10000000.0);
-                            if(target>now+Rate || target< -Rate)target=wave.Frames;
-                            wave.Packet(target,buffer,(int)frames);
+                            if((flags&2)==0){int count=checked((int)frames*wave.Align);if(buffer.Length<count)buffer=new byte[count];Marshal.Copy(data,buffer,0,count);DataFrames+=frames;}
                         }
                         finally{AudioInterop.Check(capture.ReleaseBuffer(frames));}
+                        // Release the engine buffer before disk I/O; reuse storage to avoid packet-by-packet GC.
+                        double now=AudioInterop.Qpc();MaxReadIntervalMs=Math.Max(MaxReadIntervalMs,(now-lastRead)/10000.0);lastRead=now;
+                        long target=Clock.Target(position,qpc,flags,(int)frames,now,wave.Frames);
+                        wave.Packet(target,(flags&2)==0?buffer:null,(int)frames);
                         AudioInterop.Check(capture.GetNextPacketSize(out packet));
                     }
                     if(stop.WaitOne(5)){wave.Pad((long)Math.Round((AudioInterop.Qpc()-origin)*Rate/10000000.0));break;}
-                    // Keep a little headroom for packets arriving behind the wall clock.
-                    wave.Pad(Math.Max(0,(long)((AudioInterop.Qpc()-origin)*Rate/10000000.0)-Rate/4));
+                    // No wall-clock padding here: a delayed but valid packet must not be overwritten.
+                    // Device positions preserve interior silence; only the final tail is padded on stop.
                 }
                 AudioInterop.Check(client.Stop());
+                Program.Log("AUDIO_TIMING rate="+Rate+" packets="+Clock.Packets+" discontinuities="+Clock.Discontinuities+" missingSamples="+Clock.MissingFrames+" overlapSamples="+Clock.OverlapFrames+" timestampErrors="+Clock.TimestampErrors+" clockResets="+Clock.ClockResets+" qpcBoundaryDifferences="+Clock.QpcBoundaryDifferences+" maxReadMs="+MaxReadIntervalMs.ToString("0.0",CultureInfo.InvariantCulture)+" mmcss="+MultimediaScheduling);
             }
         }
         catch(Exception ex){Failure=ex;Program.Log("AUDIO_FAILED "+ex.ToString());}
         finally
         {
             if(client!=null)try{client.Stop();}catch{}
+            if(mmcss!=IntPtr.Zero)AudioInterop.AvRevertMmThreadCharacteristics(mmcss);
             if(format!=IntPtr.Zero)Marshal.FreeCoTaskMem(format);
             AudioInterop.Release(capture);AudioInterop.Release(client);AudioInterop.Release(device);AudioInterop.Release(devices);ready.Set();
         }
@@ -183,6 +235,9 @@ internal static class MediaTools
     // GDI captures full-range desktop RGB. Convert the samples and tag the result
     // consistently; missing tags let HD players guess BT.709 for BT.601 samples.
     internal const string DesktopColorArguments="-color_range tv -colorspace bt709 -color_primaries bt709 -color_trc iec61966-2-1";
+    // NVENC's native packed-RGB conversion uses limited BT.601 coefficients.
+    // Signal that actual matrix instead of overwriting it with a BT.709 tag.
+    internal const string NvencRgbColorArguments="-color_range tv -colorspace bt470bg -color_primaries bt709 -color_trc iec61966-2-1";
     internal static string DesktopVideoFilter(CaptureSettings settings)
     {
         string filter="scale=w=max(2\\,trunc(iw*"+settings.VideoScale+"/100/2)*2):h=max(2\\,trunc(ih*"+settings.VideoScale+"/100/2)*2):flags=lanczos:in_range=pc:out_range=tv:out_color_matrix=bt709,format=yuv420p";
@@ -297,10 +352,10 @@ internal static class VideoEncoding
     internal static bool CanDuplicate(Rectangle bounds,Rectangle primary,int screens){return screens==1 && bounds==primary;}
     internal static string Select(string ffmpeg,CaptureSettings settings)
     {return settings.VideoEncoder=="NVENC" || (settings.VideoEncoder=="Auto" && SupportsNvenc(ffmpeg))?"h264_nvenc":"libx264";}
-    internal static string Arguments(CaptureSettings settings,string encoder)
+    internal static string Arguments(CaptureSettings settings,string encoder,bool rgbInput=false)
     {
         string rate=settings.VideoMbps.ToString("0.0",CultureInfo.InvariantCulture)+"M",peak=(settings.VideoMbps*2).ToString("0.0",CultureInfo.InvariantCulture)+"M",buffer=(settings.VideoMbps*4).ToString("0.0",CultureInfo.InvariantCulture)+"M";
-        string shared=" -profile:v high -g "+(settings.FrameRate*2)+" -bf 2 "+MediaTools.DesktopColorArguments;
+        string shared=" -profile:v high -g "+(settings.FrameRate*2)+" -bf 2 "+(rgbInput?MediaTools.NvencRgbColorArguments:MediaTools.DesktopColorArguments);
         if(encoder=="h264_nvenc")return "-c:v h264_nvenc -preset p5 -tune hq -rc-lookahead 0 -spatial-aq 1 -temporal-aq 1 -multipass qres"+shared+(settings.PreferQuality?" -rc constqp -qp "+settings.QualityLevel:" -rc vbr -cq "+settings.QualityLevel+" -b:v "+rate+" -maxrate "+peak+" -bufsize "+buffer);
         return "-c:v libx264 -preset veryfast"+shared+(settings.PreferQuality?" -crf "+settings.QualityLevel:" -b:v "+rate+" -maxrate "+peak+" -bufsize "+buffer);
     }
@@ -310,23 +365,23 @@ internal sealed class DesktopRecording : IDisposable
 {
     readonly string ffmpeg;
     readonly Rectangle bounds;
-    readonly bool synthetic;
+    readonly bool synthetic,allowGpuFrames;
     readonly CaptureSettings settings;
     readonly string rawVideo,rawAudio,partial;
-    readonly ManualResetEvent firstFrame=new ManualResetEvent(false);
+    readonly ManualResetEvent firstFrame=new ManualResetEvent(false),firstEncodedFrame=new ManualResetEvent(false);
     readonly Queue<string> errors=new Queue<string>();
     Process video;LoopbackAudio audio;
     double firstUnix,timeBase=0.000001;
     double firstInputSeconds,lastInputSeconds,maxInputGap;
-    int capturedFrames,duplicateFrames,droppedFrames;
+    int capturedFrames,duplicateFrames,droppedFrames,captureRateLimit;
     string captureBackend,videoEncoder;
     internal readonly string FinalPath;
     internal string WorkPath {get;private set;}
     internal DateTime StartedAt {get;private set;}
     internal bool Healthy {get{return video!=null && !video.HasExited && (!settings.SystemAudio || (audio!=null && audio.Failure==null));}}
-    internal DesktopRecording(Rectangle bounds,string pending,string workRoot,bool synthetic=false,CaptureSettings options=null)
+    internal DesktopRecording(Rectangle bounds,string pending,string workRoot,bool synthetic=false,CaptureSettings options=null,bool allowGpuFrames=true)
     {
-        this.bounds=bounds;this.synthetic=synthetic;settings=(options??SettingsStore.Snapshot()).Copy();settings.Normalize();settings.VideoMbps=settings.EffectiveVideoMbps(synthetic?new Size(320,240):bounds.Size);ffmpeg=MediaTools.Locate("ffmpeg");MediaTools.Locate("ffprobe");
+        this.bounds=bounds;this.synthetic=synthetic;this.allowGpuFrames=allowGpuFrames;settings=(options??SettingsStore.Snapshot()).Copy();settings.Normalize();settings.VideoMbps=settings.EffectiveVideoMbps(synthetic?new Size(320,240):bounds.Size);ffmpeg=MediaTools.Locate("ffmpeg");MediaTools.Locate("ffprobe");
         string name="Recording-"+DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss-fff")+"-"+Guid.NewGuid().ToString("N").Substring(0,6);
         WorkPath=Path.Combine(workRoot,name);Directory.CreateDirectory(WorkPath);Directory.CreateDirectory(pending);
         rawVideo=Path.Combine(WorkPath,"desktop.mkv");rawAudio=Path.Combine(WorkPath,"system.wav");partial=Path.Combine(WorkPath,"video.partial.mp4");FinalPath=Path.Combine(pending,name+".mp4");
@@ -337,7 +392,15 @@ internal sealed class DesktopRecording : IDisposable
         if(settings.SystemAudio){audio=new LoopbackAudio(rawAudio);audio.Start();}
         bool useDuplication=!synthetic && settings.CaptureMethod=="Auto" && VideoEncoding.CanDuplicate(bounds,Screen.PrimaryScreen.Bounds,Screen.AllScreens.Length) && VideoEncoding.SupportsDuplication(ffmpeg);
         Exception failure=null;
-        var attempts=new List<string>();if(useDuplication)attempts.Add("DXGI");attempts.Add(synthetic?"Synthetic":"GDI");
+        var attempts=new List<string>();
+        // Native-size BGRA D3D11 textures can go straight to NVENC. Keep CPU
+        // processing for resizing/sharpening and retry it if GPU startup fails.
+        if(useDuplication)
+        {
+            if(allowGpuFrames && EncoderCanUseGpuFrames(videoEncoder))attempts.Add("DXGI-GPU");
+            attempts.Add("DXGI");
+        }
+        attempts.Add(synthetic?"Synthetic":"GDI");
         foreach(string backend in attempts)
         {
             try{StartVideo(backend,videoEncoder);failure=null;break;}
@@ -349,9 +412,11 @@ internal sealed class DesktopRecording : IDisposable
         }
         if(failure!=null)throw failure;
         StartedAt=DateTime.Now;
-        File.WriteAllText(Path.Combine(WorkPath,"session.json"),new JavaScriptSerializer().Serialize(new {finalPath=FinalPath,startedAt=StartedAt.ToString("o"),videoOriginUnix=firstUnix,audioOriginUnix=audio==null?0:audio.OriginUnix,drawMouse=settings.DrawMouse,microphone=false,audioDevice=audio==null?"":audio.DeviceId,videoScale=settings.VideoScale,frameRate=settings.FrameRate,videoMbps=settings.VideoMbps,autoVideoBitrate=settings.AutoVideoBitrate,encoder=videoEncoder,capture=captureBackend,preferQuality=settings.PreferQuality,qualityLevel=settings.QualityLevel,sharpenPercent=settings.SharpenPercent,systemAudio=settings.SystemAudio,audioVolume=settings.AudioVolume,audioKbps=settings.AudioKbps,screen=new {x=bounds.X,y=bounds.Y,width=bounds.Width,height=bounds.Height}}),Encoding.UTF8);
-        Program.Log("RECORD_STARTED "+FinalPath+" capture="+captureBackend+" encoder="+videoEncoder+" qualityMode="+settings.PreferQuality+" quality="+settings.QualityLevel+" systemAudio="+settings.SystemAudio+" drawMouse="+settings.DrawMouse+" scale="+settings.VideoScale+" fps="+settings.FrameRate+" MbpsReference="+settings.VideoMbps);
+        File.WriteAllText(Path.Combine(WorkPath,"session.json"),new JavaScriptSerializer().Serialize(new {finalPath=FinalPath,startedAt=StartedAt.ToString("o"),videoOriginUnix=firstUnix,audioOriginUnix=audio==null?0:audio.OriginUnix,drawMouse=settings.DrawMouse,microphone=false,audioDevice=audio==null?"":audio.DeviceId,videoScale=settings.VideoScale,frameRate=settings.FrameRate,captureFrameRateLimit=captureRateLimit,videoMbps=settings.VideoMbps,autoVideoBitrate=settings.AutoVideoBitrate,encoder=videoEncoder,capture=captureBackend,preferQuality=settings.PreferQuality,qualityLevel=settings.QualityLevel,sharpenPercent=settings.SharpenPercent,systemAudio=settings.SystemAudio,audioVolume=settings.AudioVolume,audioKbps=settings.AudioKbps,screen=new {x=bounds.X,y=bounds.Y,width=bounds.Width,height=bounds.Height}}),Encoding.UTF8);
+        Program.Log("RECORD_STARTED "+FinalPath+" capture="+captureBackend+" captureLimit="+captureRateLimit+" encoder="+videoEncoder+" qualityMode="+settings.PreferQuality+" quality="+settings.QualityLevel+" systemAudio="+settings.SystemAudio+" drawMouse="+settings.DrawMouse+" scale="+settings.VideoScale+" fps="+settings.FrameRate+" MbpsReference="+settings.VideoMbps);
     }
+    bool EncoderCanUseGpuFrames(string encoder)
+    {return encoder=="h264_nvenc" && settings.VideoScale==100 && settings.SharpenPercent==0 && (bounds.Width&1)==0 && (bounds.Height&1)==0;}
     void CloseVideo()
     {
         if(video==null)return;
@@ -360,27 +425,35 @@ internal sealed class DesktopRecording : IDisposable
     }
     void StartVideo(string backend,string encoder)
     {
-        captureBackend=backend;firstFrame.Reset();firstUnix=0;timeBase=0.000001;capturedFrames=duplicateFrames=droppedFrames=0;firstInputSeconds=lastInputSeconds=maxInputGap=0;
+        bool gpuFrames=backend=="DXGI-GPU";
+        // ddagrab limits the polling rate; scheduler/processing delays then make
+        // an equal input/output rate undershoot. Small GPU-only headroom allows
+        // CFR to select frames for the requested output rate without a backlog.
+        captureRateLimit=gpuFrames?Math.Min(300,(settings.FrameRate*3+1)/2):settings.FrameRate;
+        captureBackend=backend;firstFrame.Reset();firstEncodedFrame.Reset();firstUnix=0;timeBase=0.000001;capturedFrames=duplicateFrames=droppedFrames=0;firstInputSeconds=lastInputSeconds=maxInputGap=0;
         // Give lavfi a microsecond time base before wall-clock timestamps are applied;
         // a 1/FPS time base would quantize capture timing and create extra CFR repeats.
-        string input=synthetic?"-re -f lavfi -i testsrc2=size=320x240:rate="+settings.FrameRate+",format=bgra":backend=="DXGI"?"-f lavfi -use_wallclock_as_timestamps 1 -i ddagrab=output_idx=0:output_fmt=bgra:draw_mouse="+(settings.DrawMouse?"1":"0")+":framerate="+settings.FrameRate+":video_size="+bounds.Width+"x"+bounds.Height+",hwdownload,format=bgra,settb=1/1000000":"-f gdigrab -use_wallclock_as_timestamps 1 -draw_mouse "+(settings.DrawMouse?"1":"0")+" -framerate "+settings.FrameRate+" -offset_x "+bounds.X+" -offset_y "+bounds.Y+" -video_size "+bounds.Width+"x"+bounds.Height+" -i desktop";
+        string input=synthetic?"-re -f lavfi -i testsrc2=size=320x240:rate="+settings.FrameRate+",format=bgra":backend=="DXGI" || gpuFrames?"-f lavfi -use_wallclock_as_timestamps 1 -i ddagrab=output_idx=0:output_fmt=bgra:draw_mouse="+(settings.DrawMouse?"1":"0")+":framerate="+captureRateLimit+":video_size="+bounds.Width+"x"+bounds.Height+(gpuFrames?"":",hwdownload,format=bgra")+",settb=1/1000000":"-f gdigrab -use_wallclock_as_timestamps 1 -draw_mouse "+(settings.DrawMouse?"1":"0")+" -framerate "+settings.FrameRate+" -offset_x "+bounds.X+" -offset_y "+bounds.Y+" -video_size "+bounds.Width+"x"+bounds.Height+" -i desktop";
         // Disable per-frame CRC: calculating it on full-resolution BGRA wastes CPU.
-        string filter="showinfo=checksum=0,setpts=PTS-STARTPTS,"+MediaTools.DesktopVideoFilter(settings);
-        string args="-hide_banner -loglevel info -y -copyts "+input+" -an -vf \""+filter+"\" "+VideoEncoding.Arguments(settings,encoder)+" -pix_fmt yuv420p -fps_mode cfr -r "+settings.FrameRate+" -progress pipe:1 -nostats -f matroska "+MediaTools.Quote(rawVideo);
+        string filter="showinfo=checksum=0,setpts=PTS-STARTPTS"+(gpuFrames?"":","+MediaTools.DesktopVideoFilter(settings));
+        // Native RGB conversion and its actual matrix/range stay together.
+        // The encoded H.264 remains 4:2:0 High profile with sRGB transfer.
+        string args="-hide_banner -loglevel info -y -copyts "+input+" -an -vf \""+filter+"\" "+VideoEncoding.Arguments(settings,encoder,gpuFrames)+" -pix_fmt "+(gpuFrames?"d3d11":"yuv420p")+" -fps_mode cfr -r "+settings.FrameRate+" -progress pipe:1 -nostats -f matroska "+MediaTools.Quote(rawVideo);
         video=new Process();video.StartInfo=new ProcessStartInfo(ffmpeg,args){UseShellExecute=false,CreateNoWindow=true,RedirectStandardInput=true,RedirectStandardError=true};
-        video.StartInfo.RedirectStandardOutput=true;video.OutputDataReceived+=delegate(object s,DataReceivedEventArgs e){if(e.Data==null)return;string[] parts=e.Data.Split('=');int count;if(parts.Length==2 && int.TryParse(parts[1],out count)){if(parts[0]=="dup_frames")duplicateFrames=count;else if(parts[0]=="drop_frames")droppedFrames=count;}};
+        Process attempt=video;
+        video.StartInfo.RedirectStandardOutput=true;video.OutputDataReceived+=delegate(object s,DataReceivedEventArgs e){if(video!=attempt || e.Data==null)return;string[] parts=e.Data.Split('=');int count;if(parts.Length==2 && int.TryParse(parts[1],out count)){if(parts[0]=="dup_frames")duplicateFrames=count;else if(parts[0]=="drop_frames")droppedFrames=count;else if(parts[0]=="frame" && count>0)firstEncodedFrame.Set();}};
         video.ErrorDataReceived+=delegate(object s,DataReceivedEventArgs e)
         {
-            if(e.Data==null)return;
+            if(video!=attempt || e.Data==null)return;
             var tb=Regex.Match(e.Data,@"config in time_base:\s*(\d+)/(\d+)");
             if(tb.Success)timeBase=double.Parse(tb.Groups[1].Value,CultureInfo.InvariantCulture)/double.Parse(tb.Groups[2].Value,CultureInfo.InvariantCulture);
             var match=Regex.Match(e.Data,@"n:\s*(\d+)\s+pts:\s*(-?\d+)");
             if(match.Success){long stamp;if(long.TryParse(match.Groups[2].Value,out stamp)){double seconds=stamp*timeBase;if(capturedFrames==0){firstInputSeconds=seconds;firstUnix=synthetic?AudioInterop.UnixNow():seconds;firstFrame.Set();}else maxInputGap=Math.Max(maxInputGap,seconds-lastInputSeconds);lastInputSeconds=seconds;capturedFrames++;}}
             lock(errors){errors.Enqueue(e.Data);while(errors.Count>40)errors.Dequeue();}
         };
-        Process attempt=video;video.EnableRaisingEvents=true;video.Exited+=delegate{if(video==attempt)firstFrame.Set();};
+        video.EnableRaisingEvents=true;video.Exited+=delegate{if(video==attempt){firstFrame.Set();firstEncodedFrame.Set();}};
         video.Start();video.BeginErrorReadLine();video.BeginOutputReadLine();
-        if(!firstFrame.WaitOne(10000) || firstUnix<=0 || !Healthy)throw new IOException("录屏未能启动，请检查 FFmpeg。\n"+RecentError());
+        if(!firstFrame.WaitOne(10000) || firstUnix<=0 || !firstEncodedFrame.WaitOne(10000) || !Healthy)throw new IOException("录屏未能启动，请检查 FFmpeg。\n"+RecentError());
         if(!synthetic && Math.Abs(firstUnix-AudioInterop.UnixNow())>30)throw new IOException("捕获时间戳与系统时间不一致，不能保证音画同步。");
     }
     string RecentError(){lock(errors)return string.Join("\n",errors.ToArray());}
@@ -401,7 +474,8 @@ internal sealed class DesktopRecording : IDisposable
         if(Math.Abs(offset)>30)throw new IOException("无法确认录屏音画时间基准，临时文件已保留。");
         MediaTools.FinalizeVideo(ffmpeg,rawVideo,rawAudio,partial,FinalPath,offset,settings);
         double inputFps=capturedFrames>1 && lastInputSeconds>firstInputSeconds?(capturedFrames-1)/(lastInputSeconds-firstInputSeconds):0;
-        File.WriteAllText(FinalPath+".recording.json",new JavaScriptSerializer().Serialize(new {systemAudioOnly=settings.SystemAudio,microphone=false,drawMouse=settings.DrawMouse,frameRate=settings.FrameRate,videoScale=settings.VideoScale,videoMbps=settings.VideoMbps,autoVideoBitrate=settings.AutoVideoBitrate,encoder=videoEncoder,capture=captureBackend,preferQuality=settings.PreferQuality,qualityLevel=settings.QualityLevel,sharpenPercent=settings.SharpenPercent,inputFrames=capturedFrames,inputFrameRate=inputFps,maxInputGapSeconds=maxInputGap,duplicatedOutputFrames=duplicateFrames,droppedOutputFrames=droppedFrames,audioVolume=settings.AudioVolume,audioKbps=settings.AudioKbps,audioOffsetSeconds=offset,duration=MediaTools.Duration(MediaTools.Probe(FinalPath)),audioDataFrames=audio==null?0:audio.DataFrames}),Encoding.UTF8);
+        var audioDiagnostics=audio==null?null:new {sampleRate=audio.Rate,packets=audio.Clock.Packets,discontinuities=audio.Clock.Discontinuities,missingSamples=audio.Clock.MissingFrames,overlapSamples=audio.Clock.OverlapFrames,timestampErrors=audio.Clock.TimestampErrors,clockResets=audio.Clock.ClockResets,qpcBoundaryDifferences=audio.Clock.QpcBoundaryDifferences,maxQpcDifferenceSamples=audio.Clock.MaxQpcDifference,maxReadIntervalMs=audio.MaxReadIntervalMs,multimediaScheduling=audio.MultimediaScheduling};
+        File.WriteAllText(FinalPath+".recording.json",new JavaScriptSerializer().Serialize(new {systemAudioOnly=settings.SystemAudio,microphone=false,drawMouse=settings.DrawMouse,frameRate=settings.FrameRate,captureFrameRateLimit=captureRateLimit,videoScale=settings.VideoScale,videoMbps=settings.VideoMbps,autoVideoBitrate=settings.AutoVideoBitrate,encoder=videoEncoder,capture=captureBackend,preferQuality=settings.PreferQuality,qualityLevel=settings.QualityLevel,sharpenPercent=settings.SharpenPercent,inputFrames=capturedFrames,inputFrameRate=inputFps,maxInputGapSeconds=maxInputGap,duplicatedOutputFrames=duplicateFrames,droppedOutputFrames=droppedFrames,audioVolume=settings.AudioVolume,audioKbps=settings.AudioKbps,audioOffsetSeconds=offset,duration=MediaTools.Duration(MediaTools.Probe(FinalPath)),audioDataFrames=audio==null?0:audio.DataFrames,audioDiagnostics=audioDiagnostics}),Encoding.UTF8);
         Program.Log("RECORD_TIMING inputFrames="+capturedFrames+" inputFps="+inputFps.ToString("0.00",CultureInfo.InvariantCulture)+" maxGapMs="+(maxInputGap*1000).ToString("0.0",CultureInfo.InvariantCulture)+" outputDup="+duplicateFrames+" outputDrop="+droppedFrames);
         Program.Log("RECORD_FINALIZED "+FinalPath+" offset="+offset.ToString("0.000000",CultureInfo.InvariantCulture));
         // Delete only known intermediates from this session, after a validated MP4 exists locally.
@@ -411,7 +485,7 @@ internal sealed class DesktopRecording : IDisposable
     public void Dispose()
     {
         if(video!=null){try{if(!video.HasExited){video.StandardInput.WriteLine("q");if(!video.WaitForExit(3000)){video.Kill();video.WaitForExit();}}}catch{}video.Dispose();video=null;}
-        if(audio!=null){audio.Dispose();audio=null;}firstFrame.Dispose();
+        if(audio!=null){audio.Dispose();audio=null;}firstFrame.Dispose();firstEncodedFrame.Dispose();
     }
 }
 
@@ -437,13 +511,13 @@ internal sealed class RecordingBadge : Form
 
 internal static class ColorEncodingTests
 {
-    internal static void CheckTags(Dictionary<string,object> probe)
+    internal static void CheckTags(Dictionary<string,object> probe,string matrix="bt709")
     {
         bool found=false;
         foreach(object value in (System.Collections.IEnumerable)probe["streams"])
         {
             var stream=(Dictionary<string,object>)value;if((string)stream["codec_type"]!="video")continue;found=true;
-            foreach(var expected in new Dictionary<string,string>{{"pix_fmt","yuv420p"},{"color_range","tv"},{"color_space","bt709"},{"color_primaries","bt709"},{"color_transfer","iec61966-2-1"}})
+            foreach(var expected in new Dictionary<string,string>{{"pix_fmt","yuv420p"},{"color_range","tv"},{"color_space",matrix},{"color_primaries","bt709"},{"color_transfer","iec61966-2-1"}})
                 if(!stream.ContainsKey(expected.Key) || (string)stream[expected.Key]!=expected.Value)
                     throw new Exception("Incorrect/missing video color tag: "+expected.Key);
         }
@@ -460,8 +534,8 @@ internal static class ColorEncodingTests
                 Color.FromArgb(128,0,0),Color.FromArgb(0,128,0),Color.FromArgb(0,0,128),Color.FromArgb(0,128,128),
                 Color.FromArgb(128,0,128),Color.FromArgb(128,128,0),Color.FromArgb(220,120,70),Color.FromArgb(25,90,160),
                 Color.FromArgb(80,170,105),Color.FromArgb(140,75,190)});
-            string ffmpeg=MediaTools.Locate("ffmpeg");int worst=0;
-            for(int test=0;test<3;test++)
+            string ffmpeg=MediaTools.Locate("ffmpeg");int worst=0;bool gpuSupported=VideoEncoding.SupportsNvenc(ffmpeg);
+            for(int test=0;test<(gpuSupported?4:3);test++)
             {
                 Size size=test==0?new Size(320,240):new Size(1280,720);
                 var settings=new CaptureSettings{SystemAudio=false,VideoScale=test==2?50:100,AutoVideoBitrate=false,VideoMbps=8};
@@ -473,10 +547,12 @@ internal static class ColorEncodingTests
                     image.Save(source,System.Drawing.Imaging.ImageFormat.Bmp);
                 }
                 settings.VideoEncoder=test==0?"x264":"Auto";
-                MediaTools.Run(ffmpeg,"-hide_banner -loglevel error -y -loop 1 -framerate 60 -i "+MediaTools.Quote(source)+" -t 0.5 -an -vf \""+MediaTools.DesktopVideoFilter(settings)+"\" "+VideoEncoding.Arguments(settings,VideoEncoding.Select(ffmpeg,settings))+" "+MediaTools.Quote(raw),30000);
-                CheckTags(MediaTools.Probe(raw));
+                string device=test==3?"-init_hw_device d3d11va=colors -filter_hw_device colors ":"";
+                string filter=test==3?"format=bgra,hwupload":MediaTools.DesktopVideoFilter(settings);
+                MediaTools.Run(ffmpeg,"-hide_banner -loglevel error -y "+device+"-loop 1 -framerate 60 -i "+MediaTools.Quote(source)+" -t 0.5 -an -vf \""+filter+"\" "+VideoEncoding.Arguments(settings,VideoEncoding.Select(ffmpeg,settings),test==3)+(test==3?" -pix_fmt d3d11":"")+" "+MediaTools.Quote(raw),30000);
+                CheckTags(MediaTools.Probe(raw),test==3?"bt470bg":"bt709");
                 MediaTools.FinalizeVideo(ffmpeg,raw,null,prefix+".partial.mp4",final,0,settings);
-                var probe=MediaTools.Probe(final);CheckTags(probe);
+                var probe=MediaTools.Probe(final);CheckTags(probe,test==3?"bt470bg":"bt709");
                 MediaTools.Run(ffmpeg,"-hide_banner -loglevel error -y -i "+MediaTools.Quote(final)+" -frames:v 1 -pix_fmt rgb24 "+MediaTools.Quote(decoded),30000);
                 using(var image=new Bitmap(decoded))
                 {
@@ -489,8 +565,109 @@ internal static class ColorEncodingTests
                     }
                 }
             }
-            File.WriteAllText(Path.Combine(directory,"color-test.txt"),"PASS: full-range desktop RGB -> limited BT.709 YUV -> RGB; black/white, 16 gray levels and 16 colors, SD/HD/scaled output; MKV and MP4 retain matrix/range/primaries/sRGB transfer; worst channel error="+worst+"/255",Encoding.UTF8);
+            File.WriteAllText(Path.Combine(directory,"color-test.txt"),"PASS: desktop RGB -> correctly tagged limited-range YUV -> RGB; CPU BT.709 and GPU native BT.601; black/white, 16 gray levels and 16 colors, SD/HD/scaled output; D3D11/NVENC color roundtrip="+(gpuSupported?"PASS":"SKIPPED (NVENC unavailable)")+"; MKV and MP4 retain matrix/range/primaries/sRGB transfer; worst channel error="+worst+"/255",Encoding.UTF8);
             return 0;
+        }
+        catch(Exception ex){File.WriteAllText(Path.Combine(directory,"failure.txt"),ex.ToString(),Encoding.UTF8);return 31;}
+    }
+}
+
+// Explicit diagnostic entrypoint; it never starts hotkeys or imports into Eagle.
+internal static class DesktopPerformanceTests
+{
+    internal static int Run(string directory)
+    {
+        Directory.CreateDirectory(directory);
+        Native.SetProcessDpiAwarenessContext(new IntPtr(-4));
+        try
+        {
+            string ffmpeg=MediaTools.Locate("ffmpeg");
+            Rectangle bounds=SystemInformation.VirtualScreen;
+            if(!VideoEncoding.CanDuplicate(bounds,Screen.PrimaryScreen.Bounds,Screen.AllScreens.Length) || !VideoEncoding.SupportsNvenc(ffmpeg))
+                throw new Exception("This comparison requires one display and NVENC.");
+            var rows=new List<object>();
+            for(int test=0;test<4;test++)
+            {
+                var options=new CaptureSettings{FrameRate=60,SystemAudio=true,VideoEncoder="NVENC",VideoScale=test==2?50:100};
+                if(test==3){options.FrameRate=30;options.SystemAudio=false;options.PreferQuality=false;options.AutoVideoBitrate=false;options.VideoMbps=12;}
+                string pending=Path.Combine(directory,"case-"+test);
+                using(var session=new DesktopRecording(bounds,pending,Path.Combine(pending,"sessions"),false,options,test!=0))
+                {
+                    session.Start();Thread.Sleep(2500);string path=session.StopAndFinalize();
+                    var json=new JavaScriptSerializer().Deserialize<Dictionary<string,object>>(File.ReadAllText(path+".recording.json",Encoding.UTF8));
+                    bool gpu=test==1 || test==3;
+                    string expected=gpu?"DXGI-GPU":"DXGI";
+                    if((string)json["capture"]!=expected || (bool)json["microphone"] || (bool)json["systemAudioOnly"]!=options.SystemAudio)
+                        throw new Exception("Unexpected capture/audio path in case "+test);
+                    var probe=MediaTools.Probe(path);ColorEncodingTests.CheckTags(probe,gpu?"bt470bg":"bt709");
+                    bool audio=false;
+                    foreach(object item in (System.Collections.IEnumerable)probe["streams"])
+                    {
+                        var stream=(Dictionary<string,object>)item;
+                        if((string)stream["codec_type"]=="audio")audio=(string)stream["codec_name"]=="aac";
+                        if((string)stream["codec_type"]=="video")
+                        {
+                            Size size=options.VideoSize(bounds.Size);
+                            if((string)stream["codec_name"]!="h264" || (string)stream["r_frame_rate"]!=options.FrameRate+"/1" || Convert.ToInt32(stream["width"])!=size.Width || Convert.ToInt32(stream["height"])!=size.Height)
+                                throw new Exception("Unexpected dimensions/codec in case "+test);
+                        }
+                    }
+                    if(audio!=options.SystemAudio || (bool)json["drawMouse"]!=options.DrawMouse || Math.Abs(Convert.ToDouble(json["audioOffsetSeconds"]))>3 || Convert.ToInt32(json["captureFrameRateLimit"])!=(gpu?(options.FrameRate*3+1)/2:options.FrameRate))
+                        throw new Exception("Unexpected audio offset or mouse setting in case "+test);
+                    rows.Add(new {test=test,path=path,metadata=json});
+                }
+            }
+            File.WriteAllText(Path.Combine(directory,"desktop-performance.json"),new JavaScriptSerializer().Serialize(rows),Encoding.UTF8);
+            File.WriteAllText(Path.Combine(directory,"desktop-performance-test.txt"),"PASS: actual CPU/GPU desktop capture at 60fps; GPU 30fps silent target-bitrate mode; 50% scaling falls back to CPU; system-only AAC audio, H.264 4:2:0, correct CPU/GPU matrix and limited-range tags, complete decode, valid timestamps and unchanged encoding quality",Encoding.UTF8);
+            return 0;
+        }
+        catch(Exception ex){File.WriteAllText(Path.Combine(directory,"failure.txt"),ex.ToString(),Encoding.UTF8);return 32;}
+    }
+}
+
+internal static class AudioTimelineTests
+{
+    internal static int Run(string directory)
+    {
+        Directory.CreateDirectory(directory);
+        try
+        {
+            foreach(int rate in new int[]{44100,48000})
+            {
+                byte[] format=new byte[18];Buffer.BlockCopy(BitConverter.GetBytes((ushort)1),0,format,0,2);Buffer.BlockCopy(BitConverter.GetBytes((ushort)1),0,format,2,2);
+                Buffer.BlockCopy(BitConverter.GetBytes(rate),0,format,4,4);Buffer.BlockCopy(BitConverter.GetBytes(rate*2),0,format,8,4);Buffer.BlockCopy(BitConverter.GetBytes((ushort)2),0,format,12,2);Buffer.BlockCopy(BitConverter.GetBytes((ushort)16),0,format,14,2);
+                string path=Path.Combine(directory,"continuous-"+rate+".wav");long lead=rate/10,gap=rate/5;int packet=rate/100;double origin=1000000000;
+                var clock=new AudioSampleClock(rate,origin);var expected=new List<byte>();expected.AddRange(new byte[lead*2]);
+                long pos=0;
+                using(var wave=new TimelineWave(path,format))
+                {
+                    for(int i=0;i<200;i++)
+                    {
+                        if(i==100){pos+=gap;expected.AddRange(new byte[gap*2]);}
+                        byte[] data=new byte[packet*2];for(int n=0;n<packet;n++){short sample=(short)(12000*Math.Sin(2*Math.PI*997*(i*packet+n)/rate));Buffer.BlockCopy(BitConverter.GetBytes(sample),0,data,n*2,2);}
+                        double jitter=i==0?0:(i%3-1)*0.9;
+                        ulong qpc=(ulong)Math.Round(origin+(lead+pos+jitter)*10000000.0/rate);uint flags=i==0||i==100?1u:0u;
+                        if(i==20)flags=4; // Invalid positions must not cut or pad this valid PCM packet.
+                        double now=origin+(lead+pos+packet+rate/200)*10000000.0/rate;
+                        long target=clock.Target(flags==4?ulong.MaxValue:(ulong)pos,flags==4?0:qpc,flags,packet,now,wave.Frames);wave.Packet(target,i==150?null:data,packet);
+                        expected.AddRange(i==150?new byte[data.Length]:data);
+                        if(i==50){target=clock.Target((ulong)pos,qpc,0,packet,now,wave.Frames);wave.Packet(target,data,packet);}
+                        pos+=packet;
+                    }
+                    wave.Pad(wave.Frames+rate/10);expected.AddRange(new byte[rate/10*2]);
+                }
+                byte[] actual=File.ReadAllBytes(path),reference=expected.ToArray();int start=46;
+                if(actual.Length!=start+reference.Length)throw new Exception("Timeline length changed at "+rate);
+                for(int n=0;n<reference.Length;n++)if(actual[start+n]!=reference[n])throw new Exception("Packet-boundary distortion at "+rate+" byte "+n);
+                if(clock.MissingFrames!=gap || clock.OverlapFrames!=packet || clock.Discontinuities!=1 || clock.TimestampErrors!=1 || clock.QpcBoundaryDifferences<100 || clock.ClockResets!=0)throw new Exception("Audio diagnostics lost genuine gap/overlap or timestamp jitter");
+                // A device-position reset retains elapsed silence; corrupt forward positions stay bounded.
+                var reset=new AudioSampleClock(rate,origin);long head=reset.Target(1000,(ulong)origin,0,packet,origin+100000,written:0)+packet;
+                long resumed=reset.Target(0,(ulong)(origin+5000000),1,packet,origin+5100000,head);
+                if(resumed!=rate/2 || reset.ClockResets!=1)throw new Exception("Device reset lost silent interval");
+                long bad=reset.Target((ulong)long.MaxValue,(ulong)(origin+5010000),0,packet,origin+5200000,resumed+packet);
+                if(bad!=resumed+packet || reset.ClockResets!=2)throw new Exception("Corrupt position manufactured silence");
+            }
+            File.WriteAllText(Path.Combine(directory,"audio-timeline-test.txt"),"PASS: 44.1/48 kHz PCM stays byte-identical through packet timestamp jitter; preserve startup/interior/tail silence and silent packets; real missing/duplicate frames, invalid timestamps and device resets handled and measured",Encoding.UTF8);return 0;
         }
         catch(Exception ex){File.WriteAllText(Path.Combine(directory,"failure.txt"),ex.ToString(),Encoding.UTF8);return 31;}
     }
