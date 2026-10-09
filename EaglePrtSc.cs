@@ -201,7 +201,7 @@ internal sealed class FeedbackToast : Form
     protected override void OnHandleCreated(EventArgs e){base.OnHandleCreated(e);Native.SetWindowDisplayAffinity(Handle,0x11);}
     internal void Present(string message,bool error)
     {
-        dismiss.Stop();text.Text=message;BackColor=error?Color.FromArgb(120,52,38):Color.FromArgb(27,66,54);
+        dismiss.Stop();dismiss.Interval=error?5000:1700;text.Text=message;BackColor=error?Color.FromArgb(120,52,38):Color.FromArgb(27,66,54);
         Rectangle screen=Screen.FromPoint(Cursor.Position).WorkingArea;Location=new Point(screen.Right-Width-24,screen.Bottom-Height-24);
         Show();dismiss.Start();
     }
@@ -505,7 +505,6 @@ internal sealed class CaptureContext : ApplicationContext
     void BeginCapture()
     {
         captureRequests++;
-        System.Media.SystemSounds.Asterisk.Play();
         Program.Log("DOUBLE recognized captureRequests="+captureRequests+" importQueue="+imports.Count);
         BeginNextCapture();
     }
@@ -604,7 +603,7 @@ internal sealed class CaptureContext : ApplicationContext
                 {
                     recordingBusy=false;recordMenu.Enabled=true;
                     if(failure!=null){Program.Log("RECORD_START_FAILED "+failure.ToString());ShowFeedback("录制启动失败\n"+failure.Message,true);Notify(failure.Message,true);}
-                    else{recording=session;recordMenu.Text="停止录制并导入 Eagle（也可长按 PrtSc）";tray.Text="正在录制 · 长按 PrtSc 停止";recordingBadge.UpdateTime(session.StartedAt);System.Media.SystemSounds.Asterisk.Play();ShowFeedback("已开始录制\n再次长按 PrtSc 停止",false);}
+                    else{recording=session;recordMenu.Text="停止录制并导入 Eagle（也可长按 PrtSc）";tray.Text="正在录制 · 长按 PrtSc 停止";recordingBadge.UpdateTime(session.StartedAt);ShowFeedback("已开始录制\n再次长按 PrtSc 停止",false);}
                     if(exitRequested)RequestExit();
                 });
             });
@@ -622,7 +621,7 @@ internal sealed class CaptureContext : ApplicationContext
                 Post(delegate
                 {
                     finalizing.Remove(session);
-                    if(failure==null){ImportProgress.Set(path,"等待提交");imports.Enqueue(path);System.Media.SystemSounds.Asterisk.Play();ShowFeedback(ImportProgress.Label(path)+" 已保存\n等待 Eagle 入库 · 待完成："+imports.Count,false);}
+                    if(failure==null){ImportProgress.Set(path,"等待提交");imports.Enqueue(path);ShowFeedback(ImportProgress.Label(path)+" 已保存\n等待 Eagle 入库 · 待完成："+imports.Count,false);}
                     else{Program.Log("RECORD_STOP_FAILED "+failure.ToString());ShowFeedback("视频处理失败，临时文件已保留\n"+session.WorkPath,true);Notify(failure.Message,true);}
                     if(exitRequested)RequestExit();
                 });
@@ -906,7 +905,8 @@ internal sealed class CaptureContext : ApplicationContext
         feedback.Present(message,error);
     }
     void Fail(string message) {waitingRelease=false;waitingClipboard=false;Program.Log("ERROR "+message);ShowFeedback(message,true);Notify(message,true);}
-    void Notify(string message,bool error) {tray.ShowBalloonTip(3000,"Eagle 截图与录制",message,error?ToolTipIcon.Warning:ToolTipIcon.Info);}
+    // Reuse the quiet visual overlay; Windows balloon notifications can play system audio.
+    void Notify(string message,bool error) {ShowFeedback(message,error);}
     protected override void ExitThreadCore()
     {
         closing=true;ImportProgress.Changed=null;imports.Dispose();feedback.Dispose();recordingBadge.Dispose();if(settingsForm!=null)settingsForm.Dispose();

@@ -1,8 +1,8 @@
 # EaglePrtSc
 
-Windows 桌面工具（v5.11）：双击 PrtSc 保存原生全屏截图到 Eagle；长按开始/停止全屏录制，保存 MP4 后自动导入 Eagle。EXE 提供中文设置界面。
+Windows 桌面工具（v5.12）：双击 PrtSc 保存原生全屏截图到 Eagle；长按开始/停止全屏录制，保存 MP4 后自动导入 Eagle。EXE 提供中文设置界面。
 
-**[下载 v5.11 便携包（含 EXE）](https://github.com/Porco24/EaglePrtSc/releases/download/v5.11/EaglePrtSc-v5.11.zip)**，也可查看 [Releases](https://github.com/Porco24/EaglePrtSc/releases)。解压后打开 `EaglePrtSc.exe`；首次启动自动检查并安装缺少的 FFmpeg / ffprobe。Eagle 需单独安装并运行。
+**[下载 v5.12 便携包（含 EXE）](https://github.com/Porco24/EaglePrtSc/releases/download/v5.12/EaglePrtSc-v5.12.zip)**，也可查看 [Releases](https://github.com/Porco24/EaglePrtSc/releases)。解压后打开 `EaglePrtSc.exe`；首次启动自动检查并安装缺少的 FFmpeg / ffprobe。Eagle 需单独安装并运行。
 
 ## 功能
 
@@ -18,7 +18,7 @@ Windows 桌面工具（v5.11）：双击 PrtSc 保存原生全屏截图到 Eagle
 - 声音可选电脑声音或静音；电脑声音可设置 0–200% 音量和 AAC 音频码率。
 - 通过 WASAPI 回环录制默认播放设备的电脑声音，始终不打开麦克风；鼠标显示可单独开关。
 - 设置保存到本地；下一次截图 / 录制生效，当前录制使用启动时的参数。
-- 显示录制计时与状态提示，不抢焦点；支持 Windows 的捕获排除。
+- 显示录制计时与无声状态提示，不抢焦点；支持 Windows 的捕获排除。截图、录制开始 / 保存及导入通知不播放提示音，避免混入电脑声音录制。
 - 截图、视频处理与 Eagle 导入分开执行，导入期间可以继续使用。
 - 上传前完整解码检查 H.264 / AAC 视频；确认入库并完成校验后自动清理本地缓存，失败时保留原文件。
 - 检测 Eagle 接口返回列表中的重复素材 ID，异常时暂停提交和缓存清理，新截图 / 录像继续保存在本地；索引恢复后自动继续。
@@ -139,3 +139,7 @@ v5.6 对照：同一 2 秒 3440×1440 / 60 fps 合成运动画面，旧 x264 ult
 安装结束时只更新下载期间未被用户改动的工具路径。离线环境可手动选择已有 FFmpeg / ffprobe。依赖安装与注册开机启动分别处理，仍通过设置中的开机启动勾选项注册。
 
 下载来源：[Gyan 官方构建](https://www.gyan.dev/ffmpeg/builds/) 和 [官方 GitHub 镜像](https://github.com/GyanD/codexffmpeg/releases)，由 [FFmpeg 下载页](https://ffmpeg.org/download.html) 列出。`Build.ps1 -Validate` 包含依赖安装隔离测试；实际联网安装测试需正常用户会话的 HTTPS 环境。
+
+## v5.12 无声反馈
+
+移除截图、录制开始与视频保存的提示音。导入及录制错误通知使用无声状态提示；错误提示保留五秒。文字反馈与录制计时继续显示，已保存的视频参数保持不变。
