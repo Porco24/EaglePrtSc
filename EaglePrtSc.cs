@@ -56,6 +56,45 @@ internal sealed class ImportCancelledException : IOException
     internal ImportCancelledException():base("此素材已在 Eagle 删除，停止重传；本地原件已保留。"){}
 }
 
+// The whole queue shares one retry window when Eagle's API or open library is unavailable.
+internal sealed class EagleConnection
+{
+    readonly object gate=new object();
+    readonly Func<DateTime> utcNow;
+    readonly Action<string> log;
+    DateTime retryAt;
+    volatile string status;
+    internal EagleConnection(Func<DateTime> utcNow,Action<string> log){this.utcNow=utcNow;this.log=log;}
+    internal string Status{get{return status;}}
+    internal string Library(Func<string> probe,Action startIfClosed)
+    {
+        lock(gate)
+        {
+            DateTime now=utcNow();
+            if(now<retryAt)throw new ImportPendingException(Math.Max(1000,(int)Math.Ceiling((retryAt-now).TotalMilliseconds)));
+            string reason;
+            try
+            {
+                string library=probe();
+                if(!string.IsNullOrWhiteSpace(library))
+                {
+                    if(status!=null){status=null;log("EAGLE_CONNECTION_RECOVERED");}
+                    return library;
+                }
+                reason="素材库未打开";
+            }
+            catch(WebException){reason="导入接口暂不可用";}
+            catch(InvalidOperationException){reason="素材库未打开";}
+            catch(ArgumentException){reason="导入接口响应无效";}
+            if(status==null && startIfClosed!=null)startIfClosed();
+            string next="等待 Eagle："+reason;
+            if(status!=next){status=next;log("EAGLE_CONNECTION_WAIT "+reason+"；保留整个导入队列");}
+            retryAt=utcNow().AddSeconds(20);
+            throw new ImportPendingException(20000);
+        }
+    }
+}
+
 internal static class ImportProgress
 {
     static readonly object Gate=new object();
@@ -439,6 +478,7 @@ internal sealed class CaptureContext : ApplicationContext
     readonly FeedbackToast feedback=new FeedbackToast();
     readonly RecordingBadge recordingBadge=new RecordingBadge();
     readonly SerialImportQueue imports;
+    readonly HashSet<string> foregroundImports=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     DesktopRecording recording;
     bool recordingBusy,exitRequested;
     long healthCheck;
@@ -455,7 +495,7 @@ internal sealed class CaptureContext : ApplicationContext
     {
         dispatcher.CreateControl();
         imports=new SerialImportQueue(ImportFile,ImportCompleted);
-        ImportProgress.Changed=delegate(string path,string stage){Post(delegate{if(ImportProgress.IsLatest(path) && (stage=="已提交，等待 Eagle 入库" || stage=="已入库，等待缓存清理" || stage=="Eagle 索引异常，原文件已保留"))ShowFeedback(ImportProgress.Label(path)+"\n"+stage,stage=="Eagle 索引异常，原文件已保留");});};
+        ImportProgress.Changed=delegate(string path,string stage){Post(delegate{if(foregroundImports.Contains(path) && ImportProgress.IsLatest(path) && (stage=="已提交，等待 Eagle 入库" || stage=="已入库，等待缓存清理"))ShowFeedback(ImportProgress.Label(path)+"\n"+stage,false);});};
         stop=new EventWaitHandle(false,EventResetMode.ManualReset,Program.Name+"-Stop");
         showSettings=new EventWaitHandle(false,EventResetMode.AutoReset,Program.Name+"-Settings");
         var menu=new ContextMenuStrip();
@@ -475,7 +515,7 @@ internal sealed class CaptureContext : ApplicationContext
     }
     void OpenSettings()
     {
-        if(settingsForm==null || settingsForm.IsDisposed)settingsForm=new SettingsForm(delegate{return "● "+(recording!=null?"正在录制":recordingBusy?"准备录制":"就绪")+" · 待完成："+imports.Count+" · "+ImportProgress.Summary;});
+        if(settingsForm==null || settingsForm.IsDisposed)settingsForm=new SettingsForm(delegate{return "● "+(recording!=null?"正在录制":recordingBusy?"准备录制":"就绪")+" · 待完成："+imports.Count+" · "+(connection.Status??(unhealthyIndex!=null?"Eagle 索引异常，原文件已保留":ImportProgress.Summary));});
         if(settingsForm.WindowState==FormWindowState.Minimized)settingsForm.WindowState=FormWindowState.Normal;
         settingsForm.Show();settingsForm.Activate();
     }
@@ -552,7 +592,7 @@ internal sealed class CaptureContext : ApplicationContext
                         string path=Path.Combine(Program.Pending,"Screenshot-"+DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss-fff")+"-"+Guid.NewGuid().ToString("N").Substring(0,6)+(screenshotSettings.ImageFormat=="JPEG"?".jpg":".png"));
                         ScreenshotOutput.Save(img,path,screenshotSettings); waitingClipboard=false;
                         Program.Log("CAPTURE "+img.Width+"x"+img.Height+" "+path);
-                        ImportProgress.Set(path,"等待提交");imports.Enqueue(path);
+                        foregroundImports.Add(path);ImportProgress.Set(path,"等待提交");imports.Enqueue(path);
                         Program.Log("QUEUED "+Path.GetFileName(path)+" count="+imports.Count);
                         ShowFeedback(ImportProgress.Label(path)+" 已保存\n等待 Eagle 入库 · 待完成："+imports.Count,false);
                     }
@@ -623,7 +663,7 @@ internal sealed class CaptureContext : ApplicationContext
                 Post(delegate
                 {
                     finalizing.Remove(session);
-                    if(failure==null){ImportProgress.Set(path,"等待提交");imports.Enqueue(path);ShowFeedback(ImportProgress.Label(path)+" 已保存\n等待 Eagle 入库 · 待完成："+imports.Count,false);}
+                    if(failure==null){foregroundImports.Add(path);ImportProgress.Set(path,"等待提交");imports.Enqueue(path);ShowFeedback(ImportProgress.Label(path)+" 已保存\n等待 Eagle 入库 · 待完成："+imports.Count,false);}
                     else{Program.Log("RECORD_STOP_FAILED "+failure.ToString());ShowFeedback("视频处理失败，临时文件已保留\n"+session.WorkPath,true);Notify(failure.Message,true);}
                     if(exitRequested)RequestExit();
                 });
@@ -637,10 +677,10 @@ internal sealed class CaptureContext : ApplicationContext
         if(recordingBusy || finalizing.Count>0){tray.Text="正在保存录制视频，完成后退出";return;}
         ExitThread();
     }
-    static string Request(string endpoint,object body)
+    static string Request(string endpoint,object body,int timeout=10000)
     {
         if(TestRequest!=null)return TestRequest(endpoint,body);
-        var req=(HttpWebRequest)WebRequest.Create("http://127.0.0.1:41595/api/"+endpoint);req.Proxy=null;req.Timeout=10000;req.ReadWriteTimeout=10000;
+        var req=(HttpWebRequest)WebRequest.Create("http://127.0.0.1:41595/api/"+endpoint);req.Proxy=null;req.Timeout=timeout;req.ReadWriteTimeout=timeout;
         if(body!=null)
         {
             req.Method="POST";req.ContentType="application/json; charset=utf-8";
@@ -652,20 +692,19 @@ internal sealed class CaptureContext : ApplicationContext
     static Dictionary<string,object> Successful(string response)
     {
         var r=new JavaScriptSerializer().Deserialize<Dictionary<string,object>>(response);
-        if(!r.ContainsKey("status") || (string)r["status"]!="success") throw new InvalidOperationException("Eagle 导入接口返回失败。");
+        if(r==null || Field(r,"status")!="success") throw new InvalidOperationException("Eagle 导入接口返回失败。");
         return r;
     }
-    static void EnsureEagle()
+    internal static Func<DateTime> TestConnectionTime;
+    static readonly EagleConnection connection=new EagleConnection(delegate{return TestConnectionTime!=null?TestConnectionTime():DateTime.UtcNow;},Program.Log);
+    static void StartEagleIfClosed()
     {
-        try{Successful(Request("library/info",null));return;}catch{}
-        if(Process.GetProcessesByName("Eagle").Length==0)
-        {
-            string executable=SettingsStore.Snapshot().EaglePath;
-            if(!File.Exists(executable))throw new FileNotFoundException("请在设置中选择 Eagle 的安装位置。");
-            Process.Start(new ProcessStartInfo(executable){UseShellExecute=true});
-        }
-        for(int i=0;i<20;i++){Thread.Sleep(500);try{Successful(Request("library/info",null));return;}catch{}}
-        throw new Exception("Eagle 尚未就绪，文件已保存在待导入目录。");
+        Process[] running=Process.GetProcessesByName("Eagle");foreach(Process process in running)process.Dispose();
+        if(running.Length!=0)return;
+        string executable=SettingsStore.Snapshot().EaglePath;
+        if(!File.Exists(executable)){Program.Log("EAGLE_START_SKIPPED 请在设置中选择 Eagle 的安装位置");return;}
+        try{using(var process=Process.Start(new ProcessStartInfo(executable){UseShellExecute=true})){} }
+        catch(System.ComponentModel.Win32Exception ex){Program.Log("EAGLE_START_FAILED "+ex.Message);}
     }
     internal static string Hash(string path)
     {
@@ -681,7 +720,11 @@ internal sealed class CaptureContext : ApplicationContext
         if(File.Exists(path))File.Replace(temporary,path,null,true);else File.Move(temporary,path);
     }
     static Dictionary<string,object> ReadMarker(string path)
-    {return new JavaScriptSerializer().Deserialize<Dictionary<string,object>>(File.ReadAllText(path,Encoding.UTF8));}
+    {
+        var marker=new JavaScriptSerializer().Deserialize<Dictionary<string,object>>(File.ReadAllText(path,Encoding.UTF8));
+        if(marker==null)throw new IOException("素材或提交记录尚未写入，已保留原文件。");
+        return marker;
+    }
     static string Field(Dictionary<string,object> value,string key)
     {return value.ContainsKey(key)?Convert.ToString(value[key],System.Globalization.CultureInfo.InvariantCulture):"";}
     static DateTime Timestamp(Dictionary<string,object> value,string key)
@@ -689,13 +732,21 @@ internal sealed class CaptureContext : ApplicationContext
         DateTime result;return DateTime.TryParse(Field(value,key),System.Globalization.CultureInfo.InvariantCulture,System.Globalization.DateTimeStyles.RoundtripKind,out result)?result.ToUniversalTime():DateTime.MinValue;
     }
     static string LibraryPath()
-    {return (string)((Dictionary<string,object>)((Dictionary<string,object>)Successful(Request("library/info",null))["data"])["library"])["path"];}
+    {
+        return connection.Library(delegate
+        {
+            var response=Successful(Request("library/info",null,3000));object data,library;
+            var info=response.TryGetValue("data",out data)?data as Dictionary<string,object>:null;
+            var location=info!=null && info.TryGetValue("library",out library)?library as Dictionary<string,object>:null;
+            return location==null?null:Field(location,"path");
+        },TestRequest==null?(Action)StartEagleIfClosed:null);
+    }
     static List<Dictionary<string,object>> MatchingItems(string path,Dictionary<string,object> confirmation)
     {
         var result=new List<Dictionary<string,object>>();
         if(confirmation!=null && confirmation.ContainsKey("id"))
         {
-            try{var response=Successful(Request("item/info?id="+Uri.EscapeDataString(Field(confirmation,"id")),null));var item=(Dictionary<string,object>)response["data"];if(Field(item,"id")!=Field(confirmation,"id"))throw new IOException("Eagle 返回了其他素材的 ID，已保留原文件。");result.Add(item);return result;}catch(WebException ex){if(ex.Status!=WebExceptionStatus.ProtocolError)throw;}catch(InvalidOperationException){}
+            try{var response=Successful(Request("item/info?id="+Uri.EscapeDataString(Field(confirmation,"id")),null));object data;var item=response.TryGetValue("data",out data)?data as Dictionary<string,object>:null;if(item==null)throw new ImportPendingException(30000);if(Field(item,"id")!=Field(confirmation,"id"))throw new IOException("Eagle 返回了其他素材的 ID，已保留原文件。");result.Add(item);return result;}catch(WebException ex){if(ex.Status!=WebExceptionStatus.ProtocolError)throw;}catch(InvalidOperationException){}
             // A previously verified item may have been removed. Never recreate it automatically.
             return result;
         }
@@ -715,10 +766,9 @@ internal sealed class CaptureContext : ApplicationContext
             if(File.Exists(path+".cancelled.json"))throw new ImportCancelledException();
             bool historical=File.Exists(path+".confirmed.json");
             if(!File.Exists(path) && !historical)throw new IOException("本地原文件不存在，无法确认 Eagle 入库。");
-            EnsureEagle();
+            string library=LibraryPath();
             var confirmation=historical?ReadMarker(path+".confirmed.json"):null;
             var submission=File.Exists(path+".submitted.json")?ReadMarker(path+".submitted.json"):null;
-            string library=LibraryPath();
             string boundLibrary=confirmation!=null?Field(confirmation,"libraryPath"):(submission!=null?Field(submission,"libraryPath"):"");
             if(boundLibrary.Length==0 && confirmation!=null)boundLibrary=Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(Field(confirmation,"verifiedPath"))));
             if(boundLibrary.Length>0 && !string.Equals(boundLibrary,library,StringComparison.OrdinalIgnoreCase)){ImportProgress.Set(path,"等待原素材库");throw new ImportPendingException(30000);}
@@ -729,14 +779,14 @@ internal sealed class CaptureContext : ApplicationContext
                 if(acceptedId!=null){submission["id"]=acceptedId;WriteMarker(path+".submitted.json",submission);Program.Log("IMPORT_RECEIPT "+Path.GetFileName(path)+" id="+acceptedId);}
             }
             var identity=confirmation??submission;
-            if(identity!=null && DeletedItem(identity,library))CancelImport(path,identity,library);
+            if(identity!=null && DeletedItem(path,identity,library))CancelImport(path,identity,library);
             if(confirmation!=null && Timestamp(confirmation,"cleanupAfter")>DateTime.UtcNow){ImportProgress.Set(path,"已入库，等待缓存清理");throw new ImportPendingException(15000);}
             string expectedHash=confirmation!=null?Field(confirmation,"sha256"):(submission!=null?Field(submission,"sha256"):Hash(path));
             if(string.IsNullOrEmpty(expectedHash))throw new IOException("提交记录缺少校验值；缓存已保留，请检查记录。");
             List<Dictionary<string,object>> matches=MatchingItems(path,identity);
             foreach(var item in matches)
             {
-                if(DeletedItem(item,library))CancelImport(path,item,library);
+                if(DeletedItem(path,item,library))CancelImport(path,item,library);
                 string stored=Path.Combine(library,"images",Field(item,"id")+".info",Field(item,"name")+"."+Field(item,"ext"));
                 // Listing an item is not proof its NAS copy is complete. Hashing runs on another worker.
                 if(!File.Exists(stored) || (File.Exists(path) && new FileInfo(stored).Length!=new FileInfo(path).Length)){ImportProgress.Set(path,"等待 NAS 复制完成");continue;}
@@ -752,7 +802,7 @@ internal sealed class CaptureContext : ApplicationContext
                 {
                     if(File.Exists(path) && Path.GetExtension(path).Equals(".mp4",StringComparison.OrdinalIgnoreCase))VideoValidation.Ensure(path);
                     if(!string.Equals(LibraryPath(),library,StringComparison.OrdinalIgnoreCase))throw new ImportPendingException(30000);
-                    if(DeletedItem(candidate,library))CancelImport(path,candidate,library);
+                    if(DeletedItem(path,candidate,library))CancelImport(path,candidate,library);
                     if(!File.Exists(stored) || Hash(stored)!=expectedHash)
                     {
                         bool found=false;
@@ -791,7 +841,7 @@ internal sealed class CaptureContext : ApplicationContext
                     // NAS hashing can take minutes; recheck preview state before deleting.
                     var current=MatchingItems(path,candidate);
                     if(current.Count==0)throw new ImportPendingException(30000);
-                    if(DeletedItem(current[0],library))CancelImport(path,current[0],library);
+                    if(DeletedItem(path,current[0],library))CancelImport(path,current[0],library);
                     if(Path.GetExtension(path).Equals(".mp4",StringComparison.OrdinalIgnoreCase)?!VideoReady(current[0]):!ImageReady(current[0]))
                     {ImportProgress.Set(path,"等待 Eagle 预览恢复");throw new ImportPendingException(30000);}
                     if(!VerifiedCache.Delete(path,stored,expectedHash,pendingRoot))throw new ImportPendingException(30000);
@@ -839,7 +889,7 @@ internal sealed class CaptureContext : ApplicationContext
         Program.Log("SUBMITTED "+Path.GetFileName(path));
         ImportProgress.Set(path,"已提交，等待 Eagle 入库");
     }
-    static bool DeletedItem(Dictionary<string,object> item,string library)
+    static bool DeletedItem(string path,Dictionary<string,object> item,string library)
     {
         if(item.ContainsKey("isDeleted") && Convert.ToBoolean(item["isDeleted"]))return true;
         string id=Field(item,"id");if(id.Length==0)return false;
@@ -848,7 +898,7 @@ internal sealed class CaptureContext : ApplicationContext
         string metadata=Path.Combine(library,"images",id+".info","metadata.json");
         if(!File.Exists(metadata))return false;
         try{var disk=ReadMarker(metadata);return Field(disk,"id")==id && disk.ContainsKey("isDeleted") && Convert.ToBoolean(disk["isDeleted"]);}
-        catch(IOException){throw new ImportPendingException(30000);}catch(ArgumentException){throw new ImportPendingException(30000);}
+        catch(IOException){ImportProgress.Set(path,"等待 Eagle 素材记录同步");throw new ImportPendingException(30000);}catch(ArgumentException){ImportProgress.Set(path,"等待 Eagle 素材记录同步");throw new ImportPendingException(30000);}
     }
     static void CancelImport(string path,Dictionary<string,object> identity,string library)
     {
@@ -857,7 +907,7 @@ internal sealed class CaptureContext : ApplicationContext
     }
     static bool LibraryReady()
     {string root=LibraryPath();return File.Exists(Path.Combine(root,"metadata.json")) && Directory.Exists(Path.Combine(root,"images"));}
-    static string unhealthyIndex;
+    static volatile string unhealthyIndex;
     static void EnsureHealthyIndex(string path)
     {
         var response=Successful(Request("item/list?limit=100",null));
@@ -896,9 +946,10 @@ internal sealed class CaptureContext : ApplicationContext
         if(closing) return;
         try{dispatcher.BeginInvoke((Action)delegate
         {
-            if(error==null){ImportProgress.Set(path,"已入库，缓存已清理");if(ImportProgress.IsLatest(path))ShowFeedback(ImportProgress.Label(path)+" 已存入 Eagle\n本地缓存已清理",false);}
-            else if(error is ImportCancelledException){ImportProgress.Set(path,"已在 Eagle 删除，停止重传");ShowFeedback(ImportProgress.Label(path)+" 已取消导入\n本地原件保留",false);}
-            else {ImportProgress.Set(path,"导入未确认，原文件保留");ShowFeedback(ImportProgress.Label(path)+" 导入未确认\n原文件保留，可从托盘重试",true);Notify(ImportProgress.Label(path)+"\n"+error.Message,true);}
+            bool foreground=foregroundImports.Remove(path);
+            if(error==null){ImportProgress.Set(path,"已入库，缓存已清理");if(foreground && ImportProgress.IsLatest(path))ShowFeedback(ImportProgress.Label(path)+" 已存入 Eagle\n本地缓存已清理",false);}
+            else if(error is ImportCancelledException){ImportProgress.Set(path,"已在 Eagle 删除，停止重传");if(foreground)ShowFeedback(ImportProgress.Label(path)+" 已取消导入\n本地原件保留",false);}
+            else {ImportProgress.Set(path,"导入未确认，原文件保留");if(foreground)ShowFeedback(ImportProgress.Label(path)+"\n"+error.Message,true);}
         });}catch(InvalidOperationException){}
     }
     void ShowFeedback(string message,bool error)
@@ -932,12 +983,17 @@ internal static class ImportPipelineTests
         try
         {
             string pending=Path.Combine(directory,"Pending"),library=Path.Combine(directory,"Eagle");Directory.CreateDirectory(pending);Directory.CreateDirectory(Path.Combine(library,"images"));File.WriteAllText(Path.Combine(library,"metadata.json"),"{}");
-            string selectedLibrary=library;int posts=0;bool timeout=false,wrongInfo=false;var items=new List<Dictionary<string,object>>();DateTime session=DateTime.UtcNow.AddHours(-1);string lastInfo=null;
+            string selectedLibrary=library;int posts=0,connectionProbes=0;bool offline=true,timeout=false,wrongInfo=false;var items=new List<Dictionary<string,object>>();DateTime session=DateTime.UtcNow.AddHours(-1),connectionTime=DateTime.UtcNow;string lastInfo=null;
             EagleReceipt.TestLogPath=Path.Combine(directory,"eagle-log.txt");File.WriteAllText(EagleReceipt.TestLogPath,"");
             CaptureContext.TestEagleSession=delegate{return session;};
+            CaptureContext.TestConnectionTime=delegate{return connectionTime;};
             CaptureContext.TestRequest=delegate(string endpoint,object body)
             {
-                if(endpoint=="library/info")return Json.Serialize(new {status="success",data=new {library=new {path=selectedLibrary}}});
+                if(endpoint=="library/info")
+                {
+                    connectionProbes++;if(offline)throw new WebException("Simulated startup connection refused",WebExceptionStatus.ConnectFailure);
+                    return Json.Serialize(new {status="success",data=new {library=new {path=selectedLibrary}}});
+                }
                 if(endpoint=="item/addFromPath"){posts++;if(timeout)throw new WebException("Simulated response lost");return "{\"status\":\"success\"}";}
                 if(endpoint.StartsWith("item/info?id=")){string id=Uri.UnescapeDataString(endpoint.Substring("item/info?id=".Length));lastInfo=id;if(wrongInfo && id=="NEWRECEIPT")return Json.Serialize(new {status="success",data=items[0]});foreach(var item in items)if((string)item["id"]==id)return Json.Serialize(new {status="success",data=item});throw new WebException("Missing item",WebExceptionStatus.ProtocolError);}
                 if(endpoint=="item/list?limit=100")return Json.Serialize(new {status="success",data=items});
@@ -945,6 +1001,11 @@ internal static class ImportPipelineTests
                 throw new Exception("Unexpected endpoint "+endpoint);
             };
             string first=Path.Combine(pending,"Screenshot-first.png"),second=Path.Combine(pending,"Screenshot-second.png");File.WriteAllText(first,"first-capture");File.WriteAllText(second,"new-capture");
+            for(int i=0;i<23;i++)Step(i%2==0?first:second,pending,true);
+            Require(connectionProbes==1 && posts==0 && File.Exists(first) && File.Exists(second) && !File.Exists(first+".submitted.json"),"Unavailable Eagle did not share a retry window or preserve files");
+            offline=false;selectedLibrary="";connectionTime=connectionTime.AddSeconds(20);Step(first,pending,true);Step(second,pending,true);
+            Require(connectionProbes==2 && posts==0,"Empty Eagle library should defer the entire queue");
+            selectedLibrary=library;connectionTime=connectionTime.AddSeconds(20);
             Step(first,pending,true);Require(posts==1,"First import not submitted");
             for(int i=0;i<10;i++)Step(first,pending,true);Require(posts==1,"Delayed Eagle index duplicated POST");
             // Simulate process restart: no in-memory recovery object survives.
@@ -973,7 +1034,9 @@ internal static class ImportPipelineTests
             items.Add(new Dictionary<string,object>{{"id","NEWRECEIPT"},{"name",Path.GetFileNameWithoutExtension(receipt)},{"ext","png"},{"isDeleted",false}});
             Step(receipt,pending,true);var receiptMarker=Json.Deserialize<Dictionary<string,object>>(File.ReadAllText(receipt+".submitted.json"));Require((string)receiptMarker["id"]=="NEWRECEIPT" && lastInfo=="NEWRECEIPT" && posts==5,"New receipt bound to stale video or duplicated POST");
             wrongInfo=true;bool mismatch=false;try{Step(receipt,pending,true);}catch(IOException){mismatch=true;}wrongInfo=false;Require(mismatch && File.Exists(receipt) && !File.Exists(receipt+".cancelled.json") && posts==5,"Other item ID substituted for latest recording");
-            string receiptFolder=Path.Combine(library,"images","NEWRECEIPT.info");Directory.CreateDirectory(receiptFolder);File.WriteAllText(Path.Combine(receiptFolder,"metadata.json"),Json.Serialize(new {id="NEWRECEIPT",isDeleted=true}));
+            string receiptFolder=Path.Combine(library,"images","NEWRECEIPT.info");Directory.CreateDirectory(receiptFolder);string receiptMetadata=Path.Combine(receiptFolder,"metadata.json");
+            File.WriteAllText(receiptMetadata,"");Step(receipt,pending,true);Require(File.Exists(receipt) && !File.Exists(receipt+".cancelled.json") && posts==5,"An empty Eagle metadata file must wait without discarding or resubmitting the capture");
+            File.WriteAllText(receiptMetadata,Json.Serialize(new {id="NEWRECEIPT",isDeleted=true}));
             bool cancelled=false;try{Step(receipt,pending,true);}catch(ImportCancelledException){cancelled=true;}Require(cancelled && File.Exists(receipt+".cancelled.json") && File.Exists(receipt) && posts==5,"Cached isDeleted=false resurrected deleted item");
             cancelled=false;try{Step(receipt,pending,true);}catch(ImportCancelledException){cancelled=true;}Require(cancelled && posts==5,"Cancelled import revived after restart");
             string deleted=Path.Combine(pending,"Screenshot-deleted.png");File.WriteAllText(deleted,"deleted");items.Add(new Dictionary<string,object>{{"id","APIDELETED"},{"name","Screenshot-deleted"},{"ext","png"},{"isDeleted",true}});
@@ -992,10 +1055,10 @@ internal static class ImportPipelineTests
                 using(var queue=new SerialImportQueue(delegate(string path){if(Interlocked.Increment(ref tries)==1)throw new IOException("NAS file still exclusively open",unchecked((int)0x80070020));},delegate(string path,Exception error){if(error!=null)failures++;finished.Set();},50))
                 {queue.Enqueue("locked-NAS");Require(finished.WaitOne(2000) && tries==2 && failures==0 && queue.Count==0,"Sharing violation dropped the import instead of retrying");}
             }
-            File.WriteAllText(Path.Combine(directory,"import-pipeline-test.txt"),"PASS: delayed index; restart deduplication; new capture progresses; library binding; partial copy; NAS grace; rename cleanup; unknown POST; recovery; legacy retention; verifier isolation; exact filename/time receipt ID; wrong ID rejected; disk/API tombstones; cancelled restart; accepted receipt retained across Eagle restart; latest recording status; sharing violation retries; image preview retention before and after confirmation; duplicate-ID pause and safe recovery",Encoding.UTF8);return 0;
+            File.WriteAllText(Path.Combine(directory,"import-pipeline-test.txt"),"PASS: shared offline retry and automatic recovery; delayed index; restart deduplication; new capture progresses; library binding; partial copy; NAS grace; rename cleanup; unknown POST; recovery; legacy retention; verifier isolation; exact filename/time receipt ID; wrong ID rejected; disk/API tombstones; cancelled restart; accepted receipt retained across Eagle restart; latest recording status; sharing violation retries; image preview retention before and after confirmation; duplicate-ID pause and safe recovery",Encoding.UTF8);return 0;
         }
         catch(Exception ex){Directory.CreateDirectory(directory);File.WriteAllText(Path.Combine(directory,"failure.txt"),ex.ToString(),Encoding.UTF8);return 61;}
-        finally{CaptureContext.TestRequest=null;CaptureContext.TestEagleSession=null;EagleReceipt.TestLogPath=null;}
+        finally{CaptureContext.TestRequest=null;CaptureContext.TestEagleSession=null;CaptureContext.TestConnectionTime=null;EagleReceipt.TestLogPath=null;}
     }
     static void TestWorkers()
     {

@@ -1,8 +1,8 @@
 # EaglePrtSc
 
-Windows 桌面工具（v5.14）：双击 PrtSc 保存原生全屏截图到 Eagle；长按开始/停止全屏录制，保存 MP4 后自动导入 Eagle。EXE 提供中文设置界面。
+Windows 桌面工具（v5.15）：双击 PrtSc 保存原生全屏截图到 Eagle；长按开始/停止全屏录制，保存 MP4 后自动导入 Eagle。EXE 提供中文设置界面。
 
-已发布版：**[下载 v5.14 便携包（含 EXE）](https://github.com/Porco24/EaglePrtSc/releases/download/v5.14/EaglePrtSc-v5.14.zip)**，也可查看 [Releases](https://github.com/Porco24/EaglePrtSc/releases)。解压后打开 `EaglePrtSc.exe`；首次启动自动检查并安装缺少的 FFmpeg / ffprobe。Eagle 需单独安装并运行。
+已发布版：**[下载 v5.15 便携包（含 EXE）](https://github.com/Porco24/EaglePrtSc/releases/download/v5.15/EaglePrtSc-v5.15.zip)**，也可查看 [Releases](https://github.com/Porco24/EaglePrtSc/releases)。解压后打开 `EaglePrtSc.exe`；首次启动自动检查并安装缺少的 FFmpeg / ffprobe。Eagle 需单独安装并运行。
 
 ## 功能
 
@@ -20,6 +20,7 @@ Windows 桌面工具（v5.14）：双击 PrtSc 保存原生全屏截图到 Eagle
 - 设置保存到本地；下一次截图 / 录制生效，当前录制使用启动时的参数。
 - 显示录制计时与无声状态提示，不抢焦点；支持 Windows 的捕获排除。截图、录制开始 / 保存及导入通知不播放提示音，避免混入电脑声音录制。
 - 截图、视频处理与 Eagle 导入分开执行，导入期间可以继续使用。
+- Eagle 未就绪时，整个队列共用连接重试，恢复后自动继续；后台恢复的历史文件不逐项弹窗，可在设置底部查看队列状态，详细原因写入 `activity.log`。
 - 上传前完整解码检查 H.264 / AAC 视频；确认入库并完成校验后自动清理本地缓存，失败时保留原文件。
 - 检测 Eagle 接口返回列表中的重复素材 ID，异常时暂停提交和缓存清理，新截图 / 录像继续保存在本地；索引恢复后自动继续。
 - 双击 EXE 或托盘图标打开设置；关闭窗口后继续在托盘运行。托盘支持重试、查看本地文件和退出；可选开机启动。
